@@ -123,7 +123,10 @@ logging:
   # it, with the level at debug, when diagnosing a device that frames nothing.
   log_payloads: false
 
-  # The forensic record of what this station published. Not a replay source.
+  # The record of what this station published, and of what it failed to publish.
+  # A scan the broker did not take is written here in full, because nothing else
+  # holds it; a scan that was delivered is recorded by length only. Not a replay
+  # source.
   # The directory must already exist; the agent will not create it.
   audit_file: /var/log/skuhus-device-serial-scanner/audit.log
   audit_max_size_mb: 64

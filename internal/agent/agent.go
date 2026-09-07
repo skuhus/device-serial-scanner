@@ -293,7 +293,7 @@ func (agent *Agent) audit(scan event.Scan, bytes int, outcome logging.Outcome, d
 	if agent.opts.Audit == nil {
 		return
 	}
-	err := agent.opts.Audit.Append(logging.AuditRecord{
+	record := logging.AuditRecord{
 		EventID:  scan.EventID,
 		Station:  agent.opts.Identity.Station,
 		DeviceID: scan.DeviceID,
@@ -301,7 +301,14 @@ func (agent *Agent) audit(scan event.Scan, bytes int, outcome logging.Outcome, d
 		Bytes:    bytes,
 		Seq:      scan.Seq,
 		Detail:   detail,
-	})
+	}
+	// A scan the broker never took is written down in full, because nothing
+	// else holds it. Not gated on log_payloads: a setting that silently turns
+	// data loss back on is not a privacy control.
+	if outcome != logging.OutcomePublished {
+		record.RawB64, record.Text = scan.RawB64, scan.Text
+	}
+	err := agent.opts.Audit.Append(record)
 	if err != nil {
 		agent.log.Error("audit log write failed", "event_id", scan.EventID, "error", err.Error())
 	}

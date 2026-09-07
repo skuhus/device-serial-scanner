@@ -27,7 +27,10 @@ The consequences, encoded in `delivery` and validated at startup:
   device layer already does this: `Device.Run` blocks on the sink channel.
 - Nothing pending is persisted across a restart, by design.
 
-The audit log is the forensic record, not a replay source.
+The audit log is the forensic record, not a replay source. It carries the
+payload of a scan that did not reach the broker, and only of those: a delivered
+scan is upstream, while an undelivered one exists nowhere else, and recording
+its length alone is how a station loses data in silence.
 
 Do not "fix" any of the above by applying the offline-first principle uniformly.
 

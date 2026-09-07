@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -255,6 +256,74 @@ func TestPublishFailureIsCountedAuditedAndLogged(t *testing.T) {
 	}
 	if !strings.Contains(line.Detail, "broker connection is down") {
 		t.Errorf("audit detail = %q, want the publish error", line.Detail)
+	}
+}
+
+// A scan the broker never took exists nowhere else. If the audit line records
+// only its length, the station has lost it and said nothing.
+func TestFailedScanIsRecoverableFromTheAuditLog(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.log")
+	audit, err := logging.OpenAudit(auditPath, 1, 1)
+	if err != nil {
+		t.Fatalf("OpenAudit: %v", err)
+	}
+	defer audit.Close()
+
+	pub := &fakePublisher{scanErr: errors.New("broker connection is down")}
+	dev := newFakeDevice("scanner-main", "A42154587")
+	opts := testOptions(t, pub, dev)
+	opts.Audit = audit
+	supervisor, err := New(opts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	runUntil(t, supervisor, func() { <-dev.sent })
+
+	if err := audit.Sync(); err != nil {
+		t.Fatalf("audit sync: %v", err)
+	}
+	line := readAudit(t, auditPath)
+	decoded, err := base64.StdEncoding.DecodeString(line.RawB64)
+	if err != nil {
+		t.Fatalf("raw_b64 %q does not decode: %v", line.RawB64, err)
+	}
+	if string(decoded) != "A42154587" {
+		t.Errorf("recovered %q from the audit log, want A42154587", decoded)
+	}
+	if line.Text == nil || *line.Text != "A42154587" {
+		t.Errorf("text = %v, want A42154587", line.Text)
+	}
+}
+
+// A delivered scan is upstream, and a copy here would make this file the replay
+// source section 6 forbids.
+func TestPublishedScanRecordsNoPayload(t *testing.T) {
+	auditPath := filepath.Join(t.TempDir(), "audit.log")
+	audit, err := logging.OpenAudit(auditPath, 1, 1)
+	if err != nil {
+		t.Fatalf("OpenAudit: %v", err)
+	}
+	defer audit.Close()
+
+	pub := &fakePublisher{}
+	dev := newFakeDevice("scanner-main", "A42154587")
+	opts := testOptions(t, pub, dev)
+	opts.Audit = audit
+	supervisor, err := New(opts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	runUntil(t, supervisor, func() { <-dev.sent })
+
+	if err := audit.Sync(); err != nil {
+		t.Fatalf("audit sync: %v", err)
+	}
+	line := readAudit(t, auditPath)
+	if line.RawB64 != "" || line.Text != nil {
+		t.Errorf("a published scan carried its payload into the audit log: %+v", line)
+	}
+	if line.Bytes != len("A42154587") {
+		t.Errorf("bytes = %d, want %d", line.Bytes, len("A42154587"))
 	}
 }
 

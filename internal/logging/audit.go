@@ -33,10 +33,20 @@ type AuditRecord struct {
 	Station  string  `json:"station"`
 	DeviceID string  `json:"device_id"`
 	Outcome  Outcome `json:"outcome"`
-	// Bytes is the payload length. The payload itself is deliberately absent.
+	// Bytes is the payload length.
 	Bytes  int    `json:"bytes"`
 	Seq    uint64 `json:"seq"`
 	Detail string `json:"detail,omitempty"`
+	// RawB64 and Text carry the payload of a scan that did not reach the
+	// broker, and are absent for one that did.
+	//
+	// A published scan needs neither: the payload is upstream, and keeping a
+	// copy here would make this file a replay source, which section 6 forbids.
+	// A scan that failed or was dropped exists nowhere else. Recording only its
+	// length is how a station loses data in silence, which is the one thing
+	// this file exists to prevent.
+	RawB64 string  `json:"raw_b64,omitempty"`
+	Text   *string `json:"text,omitempty"`
 }
 
 // Audit is an append-only JSON-lines file rotated by size.
