@@ -1,0 +1,16 @@
+# Section 13.1. Both ecosystems matter for different reasons: a Go dependency
+# carries code into the binary, and an action carries code into a job that can
+# read this repository.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

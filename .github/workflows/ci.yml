@@ -1,0 +1,125 @@
+# Runs on every push and pull request. Section 13.1.
+#
+# Actions are pinned to commit SHAs rather than tags: a tag can be moved to
+# point at different code, and these run with access to the repository.
+name: ci
+
+# Pull requests only. A merge to master is picked up by release.yml, which runs
+# these same gates before it builds, so running both would mean checking the
+# same commit twice.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt clean:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # A tidy check catches a dependency added to go.mod by hand, and one left
+      # behind by a removed import.
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The serial tests build a pseudo-terminal pair through /dev/ptmx, which
+      # the runner provides, so they need no scanner and no service container.
+      - name: go test
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+  # Cross-compiling on every pull request is cheap, and catches an arm-only
+  # breakage before a tag rather than after one.
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: arm, goarm: "7" }
+          - { goos: linux, goarch: arm, goarm: "6" }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w -X main.commit=${GITHUB_SHA} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o /dev/null ./cmd/skuhus-agent
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Built, not pushed.
+      - name: docker build
+        run: |
+          version="$(make version)"
+          docker build \
+            --build-arg COMMIT="${GITHUB_SHA}" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label org.opencontainers.image.version="$version" \
+            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+            -t skuhus-agent:"$version" .
+
+      # The label is applied at build time and the version is compiled in, so
+      # this is what keeps the two from drifting apart.
+      - name: the image reports the version in source
+        run: |
+          version="$(make version)"
+          reported="$(docker run --rm skuhus-agent:"$version" version)"
+          label="$(docker inspect skuhus-agent:"$version" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')"
+          echo "label $label"
+          [ "$label" = "$version" ] || { echo "the image label says $label, source says $version"; exit 1; }
+          echo "$reported"
+          case "$reported" in
+            "skuhus-agent $version "*) ;;
+            *) echo "the image reports something other than $version"; exit 1 ;;
+          esac

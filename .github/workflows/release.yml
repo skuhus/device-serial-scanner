@@ -1,0 +1,149 @@
+# Merging to master is what releases. The flow is:
+#
+#   feature branch -> pull request -> merge to master -> build -> tag -> release
+#
+# The tag is an output of a successful build, not its trigger: nothing is
+# tagged until the tests, every cross-compiled target and the image have all
+# been built from that commit.
+#
+# The version comes from internal/version/version.go and nowhere else. A merge
+# that did not change it builds and verifies as usual, then stops before
+# tagging, because that version has already been released. So the release step
+# of this workflow fires exactly on the merges that edited that constant.
+name: release
+
+on:
+  push:
+    branches: [master]
+  # For re-running a release whose publish step failed after the build passed.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Tags are needed to tell an already-released version from a new one.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: read the version
+        id: version
+        run: |
+          set -eu
+          version="$(make version)"
+          if [ -z "$version" ]; then
+            echo "no version in internal/version/version.go" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            echo "v${version} is already tagged; this merge builds but does not release"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v${version} is new; this merge releases if the build passes"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt clean:"; echo "$unformatted"; gofmt -d .; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: test
+        run: go test -race ./...
+
+      # Every release target, so an arm-only breakage stops the release rather
+      # than reaching a station.
+      - name: build every target
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -eu
+          version="${{ steps.version.outputs.version }}"
+          date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # A runner that reuses its workspace would otherwise carry binaries
+          # from an earlier build into this release, and checksums.txt would
+          # cheerfully vouch for them.
+          rm -rf dist build
+          mkdir -p dist
+          for platform in linux/amd64 linux/arm64 linux/arm/7 linux/arm/6 darwin/amd64 darwin/arm64; do
+            os="${platform%%/*}"; rest="${platform#*/}"; arch="${rest%%/*}"; arm="${rest#*/}"
+            [ "$arm" = "$arch" ] && arm=""
+            name="skuhus-agent-${version}-${os}-${arch}${arm:+v$arm}"
+            echo "building $name"
+            mkdir -p "build/$name"
+            GOOS="$os" GOARCH="$arch" GOARM="$arm" go build -trimpath \
+              -ldflags "-s -w -X main.commit=${GITHUB_SHA} -X main.date=${date}" \
+              -o "build/$name/skuhus-agent" ./cmd/skuhus-agent
+            # Both shapes are attached to the release: the archive for an
+            # install that wants the sample config beside the binary, and the
+            # bare binary for a station being updated in place.
+            cp config.sample.yaml README.md LICENSE "build/$name/"
+            tar -czf "dist/${name}.tar.gz" -C build "$name"
+            cp "build/$name/skuhus-agent" "dist/${name}"
+          done
+          cd dist && sha256sum ./* > checksums.txt && cat checksums.txt
+
+      - name: build the image
+        run: |
+          set -eu
+          version="${{ steps.version.outputs.version }}"
+          docker build \
+            --build-arg COMMIT="${GITHUB_SHA}" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label org.opencontainers.image.version="$version" \
+            --label org.opencontainers.image.revision="${GITHUB_SHA}" \
+            -t "ghcr.io/${GITHUB_REPOSITORY}:${version}" \
+            -t "ghcr.io/${GITHUB_REPOSITORY}:latest" .
+          reported="$(docker run --rm "ghcr.io/${GITHUB_REPOSITORY}:${version}" version)"
+          echo "$reported"
+          case "$reported" in
+            "skuhus-agent $version "*) ;;
+            *) echo "the image reports something other than $version"; exit 1 ;;
+          esac
+
+      - name: push the image
+        if: steps.version.outputs.release == 'true'
+        run: |
+          set -eu
+          version="${{ steps.version.outputs.version }}"
+          echo "${{ github.token }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          docker push "ghcr.io/${GITHUB_REPOSITORY}:${version}"
+          docker push "ghcr.io/${GITHUB_REPOSITORY}:latest"
+
+      # The tag is created by the release itself, so a tag and a release always
+      # appear together: a tag pushed separately would survive a failed publish
+      # and make the next merge skip a release that never happened.
+      - name: tag and release
+        if: steps.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version="${{ steps.version.outputs.version }}"
+          gh release create "v${version}" \
+            --target "${GITHUB_SHA}" \
+            --title "v${version}" \
+            --generate-notes \
+            dist/*
+          echo "released v${version} from ${GITHUB_SHA}"
