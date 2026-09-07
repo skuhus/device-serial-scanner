@@ -326,12 +326,12 @@ The specification names `broker.credentials_file` but not its format. It is
 lines, so that a file edited by hand cannot silently swap the two. The password
 is taken verbatim after the first `=`; a password may legitimately end in a
 space, and trimming one produces an authentication failure that reads as a
-broker fault. `SKUHUS_AGENT_MQTT_USERNAME` and `SKUHUS_AGENT_MQTT_PASSWORD` override the file,
+broker fault. `SH_DEV_SER_SCANNER_MQTT_USERNAME` and `SH_DEV_SER_SCANNER_MQTT_PASSWORD` override the file,
 per the precedence in section 9.
 
 They name MQTT rather than the broker because that is what they authenticate.
 The configuration section stays `broker:`, which section 9 fixes; the four other
-`SKUHUS_AGENT_BROKER_*` variables are unchanged, so the environment currently
+`SH_DEV_SER_SCANNER_BROKER_*` variables are unchanged, so the environment currently
 mixes both names.
 
 ### The dependency list grew by two, transitively
@@ -345,7 +345,7 @@ autopaho supports WebSocket transports. Removing them means not using autopaho.
 
 ### Loading is strict in both directions
 
-An unknown key in the YAML file and an unrecognised `SKUHUS_AGENT_*` variable
+An unknown key in the YAML file and an unrecognised `SH_DEV_SER_SCANNER_*` variable
 are both fatal. A misspelled setting that is silently ignored leaves a station
 running a value the operator believes they changed, and the fleet then disagrees
 with its own configuration management.
@@ -405,6 +405,27 @@ the whole configuration: users, permissions and topic permissions are imported
 on every boot, and the volume holds everything else.
 
 ## Naming
+
+### The binary is `skuhus-device-serial-scanner`, not `skuhus-agent`
+
+The specification says `skuhus-agent` in sections 9, 10 and 13.2, and this
+repository used that name until it produced a release carrying two names for one
+thing: `skuhus-agent-0.1.0-linux-arm64.tar.gz` beside an image at
+`ghcr.io/skuhus/device-serial-scanner`.
+
+The deeper problem was that `skuhus-agent` names a category. Section 12 plans a
+printer agent, and on a station running both, `/etc/skuhus-agent/`, the
+`SKUHUS_AGENT_*` environment, the audit directory, the system user, the systemd
+unit and the process in `ps` would all have collided.
+
+One name now: the binary, the config directory, the audit directory, the release
+assets, the container image and the account inside it. The environment prefix is
+`SH_DEV_SER_SCANNER_`, short because it is typed into unit files and shell
+history rather than read.
+
+The repository keeps its own name, `device-serial-scanner`; a repository and the
+thing it builds are allowed to differ, and renaming it would break every clone.
+
 
 Identifiers say what they hold. Receivers are `agent`, `client`, `framer`,
 `presence` rather than `a`, `c`, `f`, `p`, and locals are named for their

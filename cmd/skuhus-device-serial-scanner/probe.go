@@ -27,7 +27,7 @@ func runProbe(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprint(fs.Output(), "Usage: skuhus-agent probe [flags]\n\n"+
+		fmt.Fprint(fs.Output(), "Usage: skuhus-device-serial-scanner probe [flags]\n\n"+
 			"With --list, enumerates candidate serial devices and the stable paths\n"+
 			"that point at them. Otherwise opens one device and prints every framed\n"+
 			"payload to stdout until interrupted.\n\n"+

@@ -12,10 +12,10 @@ package version
 // of building this code agrees: "go build", "go test", an IDE and the Makefile
 // all report the same version, and there is no way to produce a binary whose
 // agent_version field is a lie about which source it came from.
-const version = "0.1.0"
+const version = "0.2.0"
 
 // Commit and date are the one part of the identity source cannot know, so they
-// are injected from cmd/skuhus-agent via Set, out of
+// are injected from cmd/skuhus-device-serial-scanner via Set, out of
 // -ldflags -X main.commit / main.date.
 var (
 	commit = "none"
@@ -44,5 +44,5 @@ func Date() string { return date }
 
 // String renders the full build identity for the version subcommand.
 func String() string {
-	return "skuhus-agent " + version + " commit=" + commit + " built=" + date
+	return "skuhus-device-serial-scanner " + version + " commit=" + commit + " built=" + date
 }
