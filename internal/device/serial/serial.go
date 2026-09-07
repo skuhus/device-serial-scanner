@@ -1,0 +1,405 @@
+// Package serial implements the Device interface over USB-CDC (virtual COM) and
+// real RS-232 ports.
+//
+// HID keyboard mode is not implemented. It needs scancode-to-character
+// translation against an assumed keyboard layout, and a Swedish-layout host
+// reading a US-configured scanner corrupts non-alphanumeric payloads silently
+// and intermittently. Scanners must be configured into CDC mode instead.
+package serial
+
+import (
+	"context"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math/rand/v2"
+	"syscall"
+	"time"
+
+	"github.com/skuhus/device-serial-scanner/internal/device"
+	goserial "go.bug.st/serial"
+)
+
+// Backoff bounds for reopening an absent device.
+const (
+	DefaultBackoffInitial = 100 * time.Millisecond
+	DefaultBackoffMax     = 30 * time.Second
+	backoffJitter         = 0.3
+
+	minReadChunk = 64
+	maxReadChunk = 4096
+)
+
+// OpenFunc opens a serial port. It is a field on Options so tests can inject
+// failures that no PTY can reproduce, such as EIO on a removed USB device.
+type OpenFunc func(path string, mode *goserial.Mode) (goserial.Port, error)
+
+// Options configures a serial device.
+type Options struct {
+	ID               string
+	Path             string
+	Baud             int
+	Terminator       []byte
+	MaxFrameBytes    int
+	InterCharTimeout time.Duration
+	// AssertConfig requests re-applying the expected scanner serial
+	// configuration on every open. No per-model profiles exist, so the device
+	// logs that it could not honour the request rather than pretending it did.
+	AssertConfig bool
+	// LogPayloads allows frame and discarded-byte contents into the log at
+	// DEBUG. Default false: counts only. See section 7 of the specification.
+	LogPayloads bool
+
+	Logger *slog.Logger
+	// OnPresence is called on every present/absent transition. It must not
+	// block; the read loop calls it inline.
+	OnPresence func(present bool, err error)
+
+	BackoffInitial time.Duration
+	BackoffMax     time.Duration
+	// StableAfter is how long a session must last before the device counts as
+	// healthy and the backoff resets. Defaults to BackoffMax.
+	StableAfter time.Duration
+	// Open defaults to the real serial port opener.
+	Open OpenFunc
+}
+
+// Device is a serial-attached device.
+type Device struct {
+	opts     Options
+	mode     *goserial.Mode
+	chunk    int
+	log      *slog.Logger
+	open     OpenFunc
+	backoffI time.Duration
+	backoffM time.Duration
+	stable   time.Duration
+}
+
+var _ device.Device = (*Device)(nil)
+
+// New validates the options and builds a device. It does not open the port;
+// opening happens in Run and is retried, because a device that is unplugged at
+// startup is an expected condition rather than a configuration error.
+func New(opts Options) (*Device, error) {
+	if opts.ID == "" {
+		return nil, errors.New("device id is required")
+	}
+	if opts.Path == "" {
+		return nil, errors.New("device path is required")
+	}
+	if opts.Baud <= 0 {
+		return nil, fmt.Errorf("device %s: baud must be positive, got %d", opts.ID, opts.Baud)
+	}
+	if opts.InterCharTimeout <= 0 {
+		return nil, fmt.Errorf("device %s: inter-character timeout must be positive, got %s", opts.ID, opts.InterCharTimeout)
+	}
+	if _, err := NewFramer(opts.Terminator, opts.MaxFrameBytes); err != nil {
+		return nil, fmt.Errorf("device %s: %w", opts.ID, err)
+	}
+
+	dev := &Device{
+		opts: opts,
+		mode: &goserial.Mode{
+			BaudRate: opts.Baud,
+			DataBits: 8,
+			Parity:   goserial.NoParity,
+			StopBits: goserial.OneStopBit,
+			// InitialStatusBits is deliberately left nil. Setting it makes the
+			// library query the modem lines during open and fail the open
+			// outright on any port without modem control. The lines are raised
+			// after open instead, where failing to do so is not fatal.
+		},
+		chunk:    min(max(opts.MaxFrameBytes, minReadChunk), maxReadChunk),
+		log:      opts.Logger,
+		open:     opts.Open,
+		backoffI: opts.BackoffInitial,
+		backoffM: opts.BackoffMax,
+		stable:   opts.StableAfter,
+	}
+	if dev.log == nil {
+		dev.log = slog.New(slog.DiscardHandler)
+	}
+	dev.log = dev.log.With("device_id", opts.ID, "device_path", opts.Path)
+	if dev.open == nil {
+		dev.open = goserial.Open
+	}
+	if dev.backoffI <= 0 {
+		dev.backoffI = DefaultBackoffInitial
+	}
+	if dev.backoffM < dev.backoffI {
+		dev.backoffM = max(DefaultBackoffMax, dev.backoffI)
+	}
+	if dev.stable <= 0 {
+		dev.stable = dev.backoffM
+	}
+	return dev, nil
+}
+
+// ID is the configured device identifier.
+func (dev *Device) ID() string { return dev.opts.ID }
+
+// Kind is always "serial".
+func (dev *Device) Kind() string { return "serial" }
+
+// Path is the configured device path.
+func (dev *Device) Path() string { return dev.opts.Path }
+
+// Direction is Inbound: a scanner produces data, it does not consume it.
+func (dev *Device) Direction() device.Direction { return device.Inbound }
+
+// Run opens the device, frames what it reads and sends frames to sink until
+// ctx is cancelled. Open failures and disconnects are retried with jittered
+// exponential backoff; Run returns only on context cancellation.
+func (dev *Device) Run(ctx context.Context, sink chan<- device.Frame) error {
+	backoff := dev.backoffI
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		started := time.Now()
+		worked, err := dev.session(ctx, sink)
+		lasted := time.Since(started)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			dev.log.Info("device stopped", "reason", "context cancelled")
+			return ctxErr
+		}
+
+		// The backoff resets only for a session that stayed up, not for one
+		// that merely opened. A failing cable lets the port open and read once
+		// before it drops, and resetting on that reopens the device several
+		// times a second for as long as the fault lasts.
+		if lasted >= dev.stable {
+			backoff = dev.backoffI
+		}
+		wait := jittered(backoff)
+		dev.log.Warn("device unavailable, reopening after backoff",
+			"error", errText(err), "error_class", classify(err),
+			"backoff", wait.String(), "session_worked", worked,
+			"session_duration", lasted.String(), "stable_after", dev.stable.String())
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+		backoff = min(backoff*2, dev.backoffM)
+	}
+}
+
+// session opens the port and reads until it fails. It reports whether the port
+// ever read successfully, which is what distinguishes a working device that
+// went away from one that never came up.
+func (dev *Device) session(ctx context.Context, sink chan<- device.Frame) (worked bool, err error) {
+	port, err := dev.open(dev.opts.Path, dev.mode)
+	if err != nil {
+		dev.log.Debug("device open failed", "error", err.Error(), "error_class", classify(err))
+		return false, fmt.Errorf("open %s: %w", dev.opts.Path, err)
+	}
+	dev.assertModemLines(port)
+	dev.logModemStatus(port)
+	dev.log.Info("device open", "baud", dev.opts.Baud, "read_chunk", dev.chunk,
+		"inter_char_timeout", dev.opts.InterCharTimeout.String(),
+		"max_frame_bytes", dev.opts.MaxFrameBytes,
+		"terminator_hex", hex.EncodeToString(dev.opts.Terminator))
+	dev.presence(true, nil)
+
+	if dev.opts.AssertConfig {
+		// Honouring this needs a per-model command set, which depends on
+		// knowing the fleet's scanner models. Saying so beats a silent no-op.
+		dev.log.Warn("assert_config requested but not asserted",
+			"reason", "no per-model scanner profile is implemented in v1")
+	}
+
+	// Read blocks in select(2) and does not observe ctx. Closing the port is
+	// what unblocks it; the library signals pending reads through an internal
+	// pipe on Close.
+	sessCtx, cancel := context.WithCancel(ctx)
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		<-sessCtx.Done()
+		if cerr := port.Close(); cerr != nil {
+			dev.log.Debug("device close returned an error", "error", cerr.Error())
+		}
+	}()
+	defer func() {
+		cancel()
+		<-closed
+		// A cancelled context means the agent is stopping, not that the device
+		// went away. Reporting absence there would put a station into the
+		// device-missing state on every clean shutdown.
+		if ctx.Err() == nil {
+			dev.presence(false, err)
+		}
+	}()
+
+	if terr := port.SetReadTimeout(dev.opts.InterCharTimeout); terr != nil {
+		return false, fmt.Errorf("set read timeout on %s: %w", dev.opts.Path, terr)
+	}
+
+	framer, ferr := NewFramer(dev.opts.Terminator, dev.opts.MaxFrameBytes)
+	if ferr != nil {
+		return false, ferr
+	}
+
+	buf := make([]byte, dev.chunk)
+	for {
+		// Checked here as well as on the sink send. Otherwise the only way out
+		// of this loop is a read error, which makes shutdown depend on the port
+		// implementation returning one from Close. A port that keeps reporting
+		// read timeouts would never let the goroutine exit.
+		if err := ctx.Err(); err != nil {
+			return worked, err
+		}
+		readBytes, rerr := port.Read(buf)
+		if rerr != nil {
+			if ctx.Err() != nil {
+				return worked, ctx.Err()
+			}
+			return worked, fmt.Errorf("read %s: %w", dev.opts.Path, rerr)
+		}
+		worked = true
+
+		if readBytes == 0 {
+			// Zero bytes with no error is the read timeout expiring.
+			if discard, ok := framer.Timeout(); ok {
+				dev.logDiscard(discard)
+			}
+			continue
+		}
+
+		dev.log.Debug("device read", "bytes", readBytes, "pending", framer.Pending(), "resyncing", framer.Resyncing())
+		frames, discards := framer.Append(buf[:readBytes])
+		for _, discard := range discards {
+			dev.logDiscard(discard)
+		}
+		for _, raw := range frames {
+			if dev.opts.LogPayloads {
+				dev.log.Debug("frame", "bytes", len(raw), "hex", hex.EncodeToString(raw))
+			}
+			frame := device.Frame{DeviceID: dev.opts.ID, Raw: raw, At: time.Now()}
+			select {
+			case sink <- frame:
+			case <-ctx.Done():
+				return worked, ctx.Err()
+			}
+		}
+	}
+}
+
+// assertModemLines raises DTR and RTS.
+//
+// On USB CDC-ACM, DTR is the host telling the device that a terminal is
+// present, and some devices hold their output until they see it; this is what
+// minicom does on connect. The library leaves the lines untouched when
+// InitialStatusBits is nil, despite documenting otherwise, so without this the
+// state would be whatever the operating system happened to leave them at.
+//
+// Ports with no modem control, such as pseudo-terminals and some USB serial
+// drivers, return ENOTTY. That is logged rather than treated as an error: the
+// port is still perfectly usable for reading.
+func (dev *Device) assertModemLines(port goserial.Port) {
+	if err := port.SetDTR(true); err != nil {
+		dev.log.Debug("could not assert DTR", "error", err.Error())
+	}
+	if err := port.SetRTS(true); err != nil {
+		dev.log.Debug("could not assert RTS", "error", err.Error())
+	}
+}
+
+// logModemStatus records the input modem lines at open. On a silent device this
+// is the first thing worth knowing: DSR and DCD say whether the peer considers
+// itself connected, and no other log line carries that.
+func (dev *Device) logModemStatus(port goserial.Port) {
+	bits, err := port.GetModemStatusBits()
+	if err != nil {
+		dev.log.Debug("modem status bits unavailable", "error", err.Error())
+		return
+	}
+	dev.log.Debug("modem status bits", "cts", bits.CTS, "dsr", bits.DSR, "dcd", bits.DCD, "ri", bits.RI)
+}
+
+// logDiscard reports thrown-away bytes. Oversize and timeout are WARN because
+// a scan was lost; resync and empty frames are DEBUG because they are the
+// expected consequence of the discard already reported.
+func (dev *Device) logDiscard(discard Discard) {
+	switch discard.Reason {
+	case DiscardOversize, DiscardTimeout:
+		dev.log.Warn("discarded partial frame", "reason", string(discard.Reason), "bytes", discard.Bytes)
+	default:
+		dev.log.Debug("discarded bytes", "reason", string(discard.Reason), "bytes", discard.Bytes)
+	}
+	// The content goes out separately and only at DEBUG, so that raising the
+	// level to see what a misconfigured scanner is sending is a deliberate act.
+	if dev.opts.LogPayloads && len(discard.Data) > 0 {
+		dev.log.Debug("discarded bytes content", "reason", string(discard.Reason),
+			"bytes", discard.Bytes, "hex", hex.EncodeToString(discard.Data))
+	}
+}
+
+func (dev *Device) presence(present bool, err error) {
+	if dev.opts.OnPresence != nil {
+		dev.opts.OnPresence(present, err)
+	}
+}
+
+// classify names the failure so a log reader can tell a missing device from a
+// permissions problem from a device that was pulled out mid-read.
+func classify(err error) string {
+	if err == nil {
+		return "none"
+	}
+	switch {
+	case errors.Is(err, syscall.EIO), errors.Is(err, syscall.ENODEV), errors.Is(err, syscall.ENXIO):
+		return "disconnected"
+	case errors.Is(err, syscall.ENOENT):
+		return "absent"
+	case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EPERM):
+		return "permission_denied"
+	case errors.Is(err, syscall.EROFS):
+		// Seen when a device node is bind-mounted read-only into a container.
+		// The port is opened read-write because a scanner may need commands
+		// sent to it, so a read-only mount fails at open.
+		return "read_only"
+	case errors.Is(err, syscall.EBUSY):
+		return "busy"
+	}
+	var pe *goserial.PortError
+	if errors.As(err, &pe) {
+		switch pe.Code() {
+		case goserial.PortClosed:
+			// The library also returns this when a read finds the port in the
+			// zero-length-readable state a disconnect leaves behind.
+			return "disconnected"
+		case goserial.PortNotFound:
+			return "absent"
+		case goserial.PermissionDenied:
+			return "permission_denied"
+		case goserial.PortBusy:
+			return "busy"
+		default:
+			return "port_error"
+		}
+	}
+	return "unknown"
+}
+
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// jittered spreads reconnect attempts so a site full of stations does not
+// retry in lockstep after a broker or USB hub blip.
+func jittered(dev time.Duration) time.Duration {
+	if dev <= 0 {
+		return 0
+	}
+	delta := float64(dev) * backoffJitter
+	return time.Duration(float64(dev) - delta + rand.Float64()*2*delta)
+}

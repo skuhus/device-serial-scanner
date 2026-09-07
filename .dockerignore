@@ -1,0 +1,11 @@
+# The build context is sent to the daemon in full; without this it carries the
+# git history and every cross-compiled binary in dist/, which is tens of
+# megabytes of things the build stage would ignore anyway.
+.git
+.github
+dist
+coverage.out
+*.out
+docs
+dev
+spike
